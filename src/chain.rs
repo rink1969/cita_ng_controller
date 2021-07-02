@@ -26,6 +26,8 @@ use cita_cloud_proto::blockchain::{
 use cita_cloud_proto::common::{
     proposal_enum::Proposal, BftProposal, ConsensusConfiguration, Hash, ProposalEnum,
 };
+use futures::future;
+use futures::future::FutureExt;
 use log::{info, warn};
 use prost::Message;
 use std::collections::HashMap;
@@ -312,6 +314,18 @@ impl Chain {
     }
 
     async fn finalize_block(&self, full_block: Block, block_hash: Vec<u8>) {
+        use tokio::task::JoinHandle;
+
+        // current task handles
+        let mut handles = Vec::<JoinHandle<()>>::new();
+        let do_store = |region, key, value| {
+            tokio::spawn(store_data(region, key, value).map(|res| match res {
+                Ok(true) => (),
+                Ok(false) => panic!("Store data failed: storage return false"),
+                Err(e) => panic!("Store data failed: {}", e),
+            }))
+        };
+
         let compact_block = full_to_compact(full_block.clone());
         let compact_block_body = compact_block.body.unwrap();
         let tx_hash_list = compact_block_body.tx_hashes.clone();
@@ -326,14 +340,10 @@ impl Chain {
         //    .expect("store proof failed");
 
         // region 4 : block_height - block hash
-        store_data(4, key.clone(), block_hash.clone())
-            .await
-            .expect("store_data failed");
+        handles.push(do_store(4, key.clone(), block_hash.clone()));
 
         // region 8 : block hash - block_height
-        store_data(8, block_hash.clone(), key.clone())
-            .await
-            .expect("store_data failed");
+        handles.push(do_store(8, block_hash.clone(), key.clone()));
 
         if !check_block_exists(block_height) {
             // region 3: block_height - block body
@@ -355,59 +365,74 @@ impl Chain {
             //    .expect("store_data failed");
 
             // store block with proof in sync folder.
-            write_block(
-                block_height,
-                block_header_bytes.as_slice(),
-                block_body_bytes.as_slice(),
-                &full_block.proof,
-            )
-            .await;
+            let proof = full_block.proof.clone();
+            handles.push(tokio::spawn(async move {
+                write_block(
+                    block_height,
+                    block_header_bytes.as_slice(),
+                    block_body_bytes.as_slice(),
+                    &proof,
+                )
+                .await;
+            }));
         }
 
         // region 1: tx_hash - tx
         if let Some(raw_txs) = full_block.body.clone() {
-            for (tx_index, raw_tx) in raw_txs.body.into_iter().enumerate() {
-                let tx_hash = match raw_tx.tx.clone() {
-                    Some(Tx::UtxoTx(utxo_tx)) => {
-                        if {
-                            let mut auth = self.auth.write().await;
-                            auth.update_system_config(&utxo_tx)
-                        } {
-                            // if sys_config changed, store utxo tx hash into global region
-                            let lock_id = utxo_tx.transaction.unwrap().lock_id;
-                            let key = lock_id.to_be_bytes().to_vec();
-                            store_data(0, key, utxo_tx.transaction_hash.clone())
-                                .await
-                                .expect("store_data failed");
-
-                            if lock_id == LOCK_ID_VALIDATORS || lock_id == LOCK_ID_BLOCK_INTERVAL {
-                                let sys_config = {
-                                    let auth = self.auth.read().await;
-                                    auth.get_system_config()
-                                };
-                                reconfigure(ConsensusConfiguration {
-                                    height: block_height,
-                                    block_interval: sys_config.block_interval,
-                                    validators: sys_config.validators,
-                                })
-                                .await
-                                .expect("reconfigure failed");
-                            }
-                        }
-                        utxo_tx.transaction_hash
+            let store_handles = raw_txs
+                .body
+                .iter()
+                .enumerate()
+                .filter_map(|(tx_index, raw_tx)| {
+                    let tx_hash = match &raw_tx.tx {
+                        Some(Tx::UtxoTx(utxo_tx)) => &utxo_tx.transaction_hash,
+                        Some(Tx::NormalTx(normal_tx)) => &normal_tx.transaction_hash,
+                        None => return None,
                     }
-                    Some(Tx::NormalTx(normal_tx)) => normal_tx.transaction_hash,
-                    None => Vec::new(),
-                };
-                // store tx
-                if !tx_hash.is_empty() {
+                    .clone();
+
                     let mut tx_bytes = Vec::new();
-                    raw_tx.encode(&mut tx_bytes).expect(
-                        format!("encode {} tx failed", hex::encode(tx_hash.clone())).as_str(),
-                    );
-                    write_tx(&tx_hash, &tx_bytes).await;
-                    store_tx_info(&tx_hash, block_height, tx_index).await;
-                }
+                    raw_tx.encode(&mut tx_bytes).unwrap();
+
+                    let h = tokio::spawn(async move {
+                        let jobs = vec![
+                            write_tx(&tx_hash, &tx_bytes).boxed(),
+                            store_tx_info(&tx_hash, block_height, tx_index).boxed(),
+                        ];
+                        future::join_all(jobs).await;
+                    });
+                    Some(h)
+                });
+            handles.extend(store_handles);
+
+            for raw_tx in raw_txs.body.into_iter() {
+                if let Some(Tx::UtxoTx(utxo_tx)) = raw_tx.tx.clone() {
+                    if {
+                        let mut auth = self.auth.write().await;
+                        auth.update_system_config(&utxo_tx)
+                    } {
+                        // if sys_config changed, store utxo tx hash into global region
+                        let lock_id = utxo_tx.transaction.unwrap().lock_id;
+                        let key = lock_id.to_be_bytes().to_vec();
+                        store_data(0, key, utxo_tx.transaction_hash.clone())
+                            .await
+                            .expect("store_data failed");
+
+                        if lock_id == LOCK_ID_VALIDATORS || lock_id == LOCK_ID_BLOCK_INTERVAL {
+                            let sys_config = {
+                                let auth = self.auth.read().await;
+                                auth.get_system_config()
+                            };
+                            reconfigure(ConsensusConfiguration {
+                                height: block_height,
+                                block_interval: sys_config.block_interval,
+                                validators: sys_config.validators,
+                            })
+                            .await
+                            .expect("reconfigure failed");
+                        }
+                    }
+                };
             }
         }
 
@@ -419,9 +444,7 @@ impl Chain {
             .await
             .unwrap_or_else(|_| vec![0u8; 32]);
         // region 6 : block_height - executed_block_hash
-        store_data(6, key.clone(), executed_block_hash)
-            .await
-            .expect("store result failed");
+        do_store(6, key.clone(), executed_block_hash);
 
         // this must be before update pool
         {
@@ -441,12 +464,13 @@ impl Chain {
         );
 
         // region 0: 0 - current height; 1 - current hash
-        store_data(0, 0u64.to_be_bytes().to_vec(), key)
-            .await
-            .expect("store_data failed");
-        store_data(0, 1u64.to_be_bytes().to_vec(), block_hash)
-            .await
-            .expect("store_data failed");
+        do_store(0, 0u64.to_be_bytes().to_vec(), key);
+        do_store(0, 1u64.to_be_bytes().to_vec(), block_hash);
+
+        let bg_results = future::join_all(handles).await;
+        if bg_results.into_iter().any(|res| res.is_err()) {
+            panic!("finalizing block failed. Background task error");
+        }
     }
 
     pub async fn commit_block(
