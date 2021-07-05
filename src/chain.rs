@@ -444,7 +444,7 @@ impl Chain {
             .await
             .unwrap_or_else(|_| vec![0u8; 32]);
         // region 6 : block_height - executed_block_hash
-        do_store(6, key.clone(), executed_block_hash);
+        handles.push(do_store(6, key.clone(), executed_block_hash));
 
         // this must be before update pool
         {
@@ -464,8 +464,8 @@ impl Chain {
         );
 
         // region 0: 0 - current height; 1 - current hash
-        do_store(0, 0u64.to_be_bytes().to_vec(), key);
-        do_store(0, 1u64.to_be_bytes().to_vec(), block_hash);
+        handles.push(do_store(0, 0u64.to_be_bytes().to_vec(), key));
+        handles.push(do_store(0, 1u64.to_be_bytes().to_vec(), block_hash));
 
         let bg_results = future::join_all(handles).await;
         if bg_results.into_iter().any(|res| res.is_err()) {
